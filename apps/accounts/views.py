@@ -1,0 +1,213 @@
+from rest_framework import permissions, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+
+from apps.accounts.models import User, UserActorType, UserRole
+from apps.accounts.serializers import (
+    ChangePasswordSerializer,
+    CurrentUserSerializer,
+    CustomTokenObtainPairSerializer,
+    RegisterSerializer,
+    UserCreateSerializer,
+    UserSerializer,
+)
+from apps.audits.models import SessionAction
+from apps.audits.services import create_session_log
+from apps.core.permissions import RoleBasedActionPermission, has_role_at_least
+
+
+class RegisterView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = RegisterSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        return Response(CurrentUserSerializer(user).data, status=status.HTTP_201_CREATED)
+
+
+class CustomTokenObtainPairView(TokenObtainPairView):
+    serializer_class = CustomTokenObtainPairSerializer
+
+    def post(self, request, *args, **kwargs):
+        response = super().post(request, *args, **kwargs)
+
+        identifier = request.data.get('email') or request.data.get('username') or ''
+        user = None
+        if response.status_code == status.HTTP_200_OK:
+            user_id = (response.data or {}).get('user', {}).get('id')
+            if user_id:
+                user = User.objects.filter(pk=user_id).first()
+
+        create_session_log(
+            request=request,
+            action=SessionAction.LOGIN,
+            success=response.status_code == status.HTTP_200_OK,
+            user=user,
+            auth_identifier=identifier,
+            metadata={'status_code': response.status_code},
+        )
+        return response
+
+
+class LogoutView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        refresh = request.data.get('refresh')
+        if not refresh:
+            create_session_log(
+                request=request,
+                action=SessionAction.LOGOUT,
+                success=False,
+                user=request.user,
+                auth_identifier=request.user.email,
+                metadata={'reason': 'missing_refresh'},
+            )
+            return Response({'detail': 'Refresh token requerido'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            token = RefreshToken(refresh)
+            token.blacklist()
+        except TokenError:
+            create_session_log(
+                request=request,
+                action=SessionAction.LOGOUT,
+                success=False,
+                user=request.user,
+                auth_identifier=request.user.email,
+                metadata={'reason': 'invalid_refresh'},
+            )
+            return Response({'detail': 'Refresh token invalido'}, status=status.HTTP_400_BAD_REQUEST)
+
+        create_session_log(
+            request=request,
+            action=SessionAction.LOGOUT,
+            success=True,
+            user=request.user,
+            auth_identifier=request.user.email,
+            metadata={'status_code': status.HTTP_205_RESET_CONTENT},
+        )
+        return Response(status=status.HTTP_205_RESET_CONTENT)
+
+
+class MeView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        return Response(CurrentUserSerializer(request.user).data)
+
+
+class ChangePasswordView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = ChangePasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        user = request.user
+        if not user.check_password(serializer.validated_data['old_password']):
+            return Response({'old_password': ['Contrasena actual invalida']}, status=status.HTTP_400_BAD_REQUEST)
+
+        user.set_password(serializer.validated_data['new_password'])
+        user.save(update_fields=['password', 'updated_at'])
+        create_session_log(
+            request=request,
+            action=SessionAction.PASSWORD_CHANGE,
+            success=True,
+            user=request.user,
+            auth_identifier=request.user.email,
+        )
+        return Response({'detail': 'Contrasena actualizada'})
+
+
+class UserViewSet(viewsets.ModelViewSet):
+    queryset = User.objects.all().order_by('-created_at')
+    permission_classes = [permissions.IsAuthenticated, RoleBasedActionPermission]
+    search_fields = ['email', 'first_name', 'last_name', 'username']
+    filterset_fields = ['role', 'is_active', 'is_staff']
+    ordering_fields = ['created_at', 'email', 'role']
+
+    required_roles_per_action = {
+        'list': UserRole.ADMINISTRADOR,
+        'retrieve': UserRole.ADMINISTRADOR,
+        'create': UserRole.ADMINISTRADOR,
+        'update': UserRole.ADMINISTRADOR,
+        'partial_update': UserRole.ADMINISTRADOR,
+        'destroy': UserRole.SUPERADMIN,
+        'activate': UserRole.ADMINISTRADOR,
+        'deactivate': UserRole.ADMINISTRADOR,
+    }
+
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return UserCreateSerializer
+        return UserSerializer
+
+    def perform_create(self, serializer):
+        role = serializer.validated_data.get('role', UserRole.CONSULTA)
+        requester = self.request.user
+        if role == UserRole.SUPERADMIN and not has_role_at_least(requester, UserRole.SUPERADMIN):
+            raise permissions.PermissionDenied('Solo superadmin puede crear usuarios superadmin')
+        serializer.save()
+
+    @action(detail=True, methods=['post'])
+    def activate(self, request, pk=None):
+        user = self.get_object()
+        user.is_active = True
+        user.save(update_fields=['is_active', 'updated_at'])
+        return Response({'detail': 'Usuario activado'})
+
+    @action(detail=True, methods=['post'])
+    def deactivate(self, request, pk=None):
+        user = self.get_object()
+        user.is_active = False
+        user.save(update_fields=['is_active', 'updated_at'])
+        return Response({'detail': 'Usuario desactivado'})
+
+
+class RoleListView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        data = [{'value': choice[0], 'label': choice[1]} for choice in UserRole.choices]
+        return Response(data)
+
+
+class ActorTypeListView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        data = [{'value': choice[0], 'label': choice[1]} for choice in UserActorType.choices]
+        return Response(data)
+
+
+class CustomTokenRefreshView(TokenRefreshView):
+    def post(self, request, *args, **kwargs):
+        user = None
+        identifier = ''
+        raw_refresh = request.data.get('refresh')
+        if raw_refresh:
+            try:
+                refresh_token = RefreshToken(raw_refresh)
+                user_id = refresh_token.payload.get('user_id')
+                if user_id:
+                    user = User.objects.filter(pk=user_id).first()
+                    identifier = user.email if user else str(user_id)
+            except TokenError:
+                identifier = ''
+
+        response = super().post(request, *args, **kwargs)
+        create_session_log(
+            request=request,
+            action=SessionAction.REFRESH,
+            success=response.status_code == status.HTTP_200_OK,
+            user=user,
+            auth_identifier=identifier,
+            metadata={'status_code': response.status_code},
+        )
+        return response

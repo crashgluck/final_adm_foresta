@@ -1,0 +1,2 @@
+function f(o,e="Ocurrió un error inesperado."){const r=o?.response?.data;if(!r)return e;if(typeof r=="string")return r;if(typeof r.detail=="string")return r.detail;if(r.errors&&typeof r.errors=="object"){const[s,i]=Object.entries(r.errors)[0]||[];if(!s)return e;if(Array.isArray(i))return`${s}: ${i[0]}`;if(typeof i=="string")return`${s}: ${i}`}const[n,t]=Object.entries(r)[0]||[];return n?Array.isArray(t)?`${n}: ${t[0]}`:typeof t=="string"?`${n}: ${t}`:e:e}export{f as e};
+//# sourceMappingURL=apiError-D7s54Vn2.js.map
