@@ -1,3 +1,6 @@
+import secrets
+
+from django.core.cache import cache
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -123,6 +126,58 @@ class ChangePasswordView(APIView):
             auth_identifier=request.user.email,
         )
         return Response({'detail': 'Contrasena actualizada'})
+
+
+class PasswordResetRequestView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        email = (request.data.get('email') or '').strip().lower()
+        if not email:
+            return Response({'email': ['Correo requerido']}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = User.objects.filter(email__iexact=email).first()
+        if not user:
+            return Response({'detail': 'Si el correo existe, se enviara un codigo de recuperacion.'})
+
+        token = secrets.token_urlsafe(24)
+        cache_key = f'auth:password-reset:{email}:{token}'
+        cache.set(cache_key, str(user.id), timeout=60 * 30)
+        return Response(
+            {
+                'detail': 'Codigo de recuperacion generado.',
+                'recovery_token': token,
+                'expires_in_minutes': 30,
+                'channel': 'manual_token',
+            }
+        )
+
+
+class PasswordResetConfirmView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        email = (request.data.get('email') or '').strip().lower()
+        token = (request.data.get('token') or '').strip()
+        new_password = request.data.get('new_password') or ''
+        if not email or not token or not new_password:
+            return Response({'detail': 'email, token y new_password son obligatorios.'}, status=status.HTTP_400_BAD_REQUEST)
+        if len(new_password) < 8:
+            return Response({'new_password': ['Minimo 8 caracteres']}, status=status.HTTP_400_BAD_REQUEST)
+
+        cache_key = f'auth:password-reset:{email}:{token}'
+        user_id = cache.get(cache_key)
+        if not user_id:
+            return Response({'detail': 'Token inválido o expirado.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = User.objects.filter(id=user_id, email__iexact=email).first()
+        if not user:
+            return Response({'detail': 'Usuario no encontrado para este token.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user.set_password(new_password)
+        user.save(update_fields=['password', 'updated_at'])
+        cache.delete(cache_key)
+        return Response({'detail': 'Contrasena restablecida correctamente.'})
 
 
 class UserViewSet(viewsets.ModelViewSet):

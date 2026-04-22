@@ -17,6 +17,13 @@ class IssueSeverity(models.TextChoices):
     ERROR = 'ERROR', 'Error'
 
 
+class ImportUploadStatus(models.TextChoices):
+    UPLOADED = 'UPLOADED', 'Uploaded'
+    PREVIEWED = 'PREVIEWED', 'Previewed'
+    EXECUTED = 'EXECUTED', 'Executed'
+    EXPIRED = 'EXPIRED', 'Expired'
+
+
 class ImportJob(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     source_file = models.CharField(max_length=255)
@@ -71,4 +78,22 @@ class ImportIssue(models.Model):
 
     class Meta:
         ordering = ['-created_at']
+
+
+class ImportUploadSession(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    original_filename = models.CharField(max_length=255)
+    stored_file = models.FileField(upload_to='imports/uploads/%Y/%m/%d/')
+    source_hash = models.CharField(max_length=128, blank=True)
+    status = models.CharField(max_length=20, choices=ImportUploadStatus.choices, default=ImportUploadStatus.UPLOADED)
+    uploaded_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    last_used_at = models.DateTimeField(auto_now=True)
+    selected_sheets = models.JSONField(default=list, blank=True)
+    column_mapping = models.JSONField(default=dict, blank=True)
+    preview_job = models.ForeignKey(ImportJob, null=True, blank=True, on_delete=models.SET_NULL, related_name='preview_upload_sessions')
+    executed_job = models.ForeignKey(ImportJob, null=True, blank=True, on_delete=models.SET_NULL, related_name='executed_upload_sessions')
+
+    class Meta:
+        ordering = ['-uploaded_at']
 

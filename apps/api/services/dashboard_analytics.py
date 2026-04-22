@@ -309,6 +309,10 @@ class DashboardAnalyticsService:
         residents_total = self._apply_parcel_filter(ParcelResident.objects.filter(is_active=True)).count()
         vehicles_total = self._apply_parcel_filter(Vehicle.objects.filter(activo=True)).count()
         visits_today = self._apply_parcel_filter(Visit.objects.filter(visit_datetime__date=self.today)).count()
+        blocked_accesses = self._apply_parcel_filter(
+            AccessRecord.objects.filter(status='blocked', access_datetime__date__range=(self.date_range.date_from, self.date_range.date_to))
+        ).count()
+        blocked_accesses_today = self._apply_parcel_filter(AccessRecord.objects.filter(status='blocked', access_datetime__date=self.today)).count()
 
         today_income_qs = self._income_queryset().filter(occurred_at__date=self.today)
         payments_today_qs = today_income_qs.filter(category__in=self.payment_categories)
@@ -341,6 +345,8 @@ class DashboardAnalyticsService:
             'residents_total': residents_total,
             'vehicles_total': vehicles_total,
             'visits_today': visits_today,
+            'blocked_accesses': blocked_accesses,
+            'blocked_accesses_today': blocked_accesses_today,
             'payments_today': payments_today,
             'collected_today': to_money(collected_today),
             'collected_month': to_money(collected_month),

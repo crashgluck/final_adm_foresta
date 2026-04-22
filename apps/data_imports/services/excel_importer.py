@@ -40,11 +40,98 @@ class Counter:
 
 
 class ExcelMasterImporter:
-    def __init__(self, file_path: str, dry_run: bool = False, initiated_by=None, sheets: list[str] | None = None):
+    SHEET_REQUIREMENTS = {
+        'Datos_Propietarios': ['parcela', 'nombre completo', 'rut'],
+        'OTROS DUEÑOS': ['parcela'],
+        'RESIDENTES': ['parcela', 'residente'],
+        'PPU_LOGOS': ['parcela', 'ppu'],
+        'Mora GC': ['parcela', 'mora cg uf', 'total pesos'],
+        'DESUDAS AyS': ['parcela', 'total deuda'],
+        'MORA CONVENIO': ['parcela', 'total mora'],
+        'Multas-Convenios impagas': ['parcela', 'empresa', 'saldo monto'],
+        'Cortes Vigentes': ['cliente', 'estado'],
+        'HISTORICO AYS': ['parcela', 'solicitante', 'descripcion'],
+        'ANOTACIONES': ['parcela', 'fecha', 'anotacion'],
+        'OBRAS': ['parcela n', 'cortafuego', 'limpieza'],
+    }
+
+    def __init__(
+        self,
+        file_path: str,
+        dry_run: bool = False,
+        initiated_by=None,
+        sheets: list[str] | None = None,
+        column_mapping: dict | None = None,
+    ):
         self.file_path = Path(file_path)
         self.dry_run = dry_run
         self.initiated_by = initiated_by
         self.sheets_filter = {s.strip() for s in sheets} if sheets else None
+        self.column_mapping = self._normalize_column_mapping(column_mapping or {})
+
+    def _parser_map(self):
+        return {
+            'Datos_Propietarios': self._parse_datos_propietarios,
+            'OTROS DUEÑOS': self._parse_otros_duenos,
+            'RESIDENTES': self._parse_residentes,
+            'PPU_LOGOS': self._parse_vehiculos,
+            'Mora GC': self._parse_mora_gc,
+            'DESUDAS AyS': self._parse_deudas_ays,
+            'MORA CONVENIO': self._parse_mora_convenio,
+            'Multas-Convenios impagas': self._parse_multas,
+            'Cortes Vigentes': self._parse_cortes,
+            'HISTORICO AYS': self._parse_historico_ays,
+            'ANOTACIONES': self._parse_anotaciones,
+            'OBRAS': self._parse_obras,
+        }
+
+    def inspect_structure(self):
+        workbook = load_workbook(self.file_path, data_only=True)
+        parser_map = self._parser_map()
+        checks = []
+        for sheet_name in parser_map.keys():
+            if self.sheets_filter and sheet_name not in self.sheets_filter:
+                continue
+            required_keywords = self.SHEET_REQUIREMENTS.get(sheet_name, [])
+            if sheet_name not in workbook.sheetnames:
+                checks.append(
+                    {
+                        'sheet_name': sheet_name,
+                        'exists': False,
+                        'header_found': False,
+                        'required_keywords': required_keywords,
+                        'missing_keywords': required_keywords,
+                        'header_row': None,
+                    }
+                )
+                continue
+            ws = workbook[sheet_name]
+            header_row, headers = self._find_header(ws, required_keywords) if required_keywords else (1, {})
+            missing = []
+            if required_keywords and headers:
+                missing = [
+                    keyword
+                    for keyword in required_keywords
+                    if not any(self._norm_header(keyword) == key or self._norm_header(keyword) in key for key in headers.keys())
+                ]
+            elif required_keywords:
+                missing = list(required_keywords)
+
+            checks.append(
+                {
+                    'sheet_name': sheet_name,
+                    'exists': True,
+                    'header_found': bool(header_row),
+                    'required_keywords': required_keywords,
+                    'missing_keywords': missing,
+                    'header_row': header_row or None,
+                }
+            )
+
+        return {
+            'available_sheets': workbook.sheetnames,
+            'checks': checks,
+        }
 
     def run(self) -> ImportJob:
         if not self.file_path.exists():
@@ -59,20 +146,7 @@ class ExcelMasterImporter:
             initiated_by=self.initiated_by,
         )
 
-        parser_map = {
-            'Datos_Propietarios': self._parse_datos_propietarios,
-            'OTROS DUEÑOS': self._parse_otros_duenos,
-            'RESIDENTES': self._parse_residentes,
-            'PPU_LOGOS': self._parse_vehiculos,
-            'Mora GC': self._parse_mora_gc,
-            'DESUDAS AyS': self._parse_deudas_ays,
-            'MORA CONVENIO': self._parse_mora_convenio,
-            'Multas-Convenios impagas': self._parse_multas,
-            'Cortes Vigentes': self._parse_cortes,
-            'HISTORICO AYS': self._parse_historico_ays,
-            'ANOTACIONES': self._parse_anotaciones,
-            'OBRAS': self._parse_obras,
-        }
+        parser_map = self._parser_map()
 
         workbook = load_workbook(self.file_path, data_only=True)
         for sheet_name, parser in parser_map.items():
@@ -118,6 +192,27 @@ class ExcelMasterImporter:
 
         self._finalize_job(job)
         return job
+
+    def _normalize_column_mapping(self, value):
+        normalized = {}
+        if not isinstance(value, dict):
+            return normalized
+        for sheet_name, aliases in value.items():
+            sheet_key = self._norm_header(sheet_name)
+            if not isinstance(aliases, dict):
+                continue
+            normalized[sheet_key] = {}
+            for source_alias, mapped_alias in aliases.items():
+                source_key = self._norm_header(source_alias)
+                if not source_key:
+                    continue
+                if isinstance(mapped_alias, list):
+                    normalized[sheet_key][source_key] = [self._norm_header(item) for item in mapped_alias if self._norm_header(item)]
+                else:
+                    mapped_key = self._norm_header(mapped_alias)
+                    if mapped_key:
+                        normalized[sheet_key][source_key] = [mapped_key]
+        return normalized
 
     def _finalize_job(self, job: ImportJob):
         aggregates = job.sheet_results.aggregate(
@@ -207,10 +302,13 @@ class ExcelMasterImporter:
         return 0, {}
 
     def _cell(self, ws, row: int, col_map: dict[str, int], *aliases: str):
+        sheet_mapping = self.column_mapping.get(self._norm_header(ws.title), {})
         for alias in aliases:
             norm_alias = self._norm_header(alias)
+            lookup_aliases = [norm_alias]
+            lookup_aliases.extend(sheet_mapping.get(norm_alias, []))
             for key, idx in col_map.items():
-                if norm_alias == key or norm_alias in key:
+                if any(candidate == key or candidate in key for candidate in lookup_aliases):
                     return ws.cell(row=row, column=idx).value
         return None
 

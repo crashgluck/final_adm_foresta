@@ -1,12 +1,72 @@
-﻿from rest_framework import permissions, status, viewsets
+import csv
+import hashlib
+import json
+import uuid
+
+from django.http import HttpResponse
+from django.utils import timezone
+from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 
 from apps.accounts.models import UserRole
-from apps.core.permissions import RoleBasedActionPermission, has_role_at_least
-from apps.data_imports.models import ImportIssue, ImportJob
-from apps.data_imports.serializers import ImportIssueSerializer, ImportJobSerializer
+from apps.core.permissions import RoleBasedActionPermission
+from apps.data_imports.models import ImportIssue, ImportJob, ImportUploadSession, ImportUploadStatus
+from apps.data_imports.serializers import ImportIssueSerializer, ImportJobSerializer, ImportUploadSessionSerializer
 from apps.data_imports.services.excel_importer import ExcelMasterImporter
+
+
+def _parse_sheets(raw_value):
+    if not raw_value:
+        return None
+    if isinstance(raw_value, list):
+        return [str(item).strip() for item in raw_value if str(item).strip()]
+    if isinstance(raw_value, str):
+        return [item.strip() for item in raw_value.split(',') if item.strip()]
+    return None
+
+
+def _parse_column_mapping(raw_value):
+    if not raw_value:
+        return {}
+    if isinstance(raw_value, dict):
+        return raw_value
+    if isinstance(raw_value, str):
+        try:
+            payload = json.loads(raw_value)
+            if not isinstance(payload, dict):
+                raise ValueError('column_mapping debe ser un objeto JSON.')
+            return payload
+        except json.JSONDecodeError:
+            raise ValueError('column_mapping tiene un JSON inválido.')
+    raise ValueError('column_mapping debe enviarse como JSON objeto.')
+
+
+def _parse_bool(raw_value, default=False):
+    if raw_value is None:
+        return default
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, (int, float)):
+        return bool(raw_value)
+    if isinstance(raw_value, str):
+        value = raw_value.strip().lower()
+        if value in {'1', 'true', 'yes', 'si', 'on'}:
+            return True
+        if value in {'0', 'false', 'no', 'off'}:
+            return False
+    return default
+
+
+def _file_sha256(upload_file) -> str:
+    digest = hashlib.sha256()
+    current_position = upload_file.tell()
+    upload_file.seek(0)
+    for chunk in upload_file.chunks():
+        digest.update(chunk)
+    upload_file.seek(current_position)
+    return digest.hexdigest()
 
 
 class ImportJobViewSet(viewsets.ReadOnlyModelViewSet):
@@ -15,11 +75,15 @@ class ImportJobViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [RoleBasedActionPermission]
     filterset_fields = ['status', 'dry_run', 'initiated_by']
     ordering_fields = ['started_at', 'finished_at', 'status']
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
 
     required_roles_per_action = {
-        'list': UserRole.ADMINISTRADOR,
-        'retrieve': UserRole.ADMINISTRADOR,
+        'list': UserRole.OPERADOR,
+        'retrieve': UserRole.OPERADOR,
         'run': UserRole.OPERADOR,
+        'preview_upload': UserRole.OPERADOR,
+        'run_upload': UserRole.OPERADOR,
+        'issues_report': UserRole.OPERADOR,
     }
 
     @action(detail=False, methods=['post'])
@@ -28,14 +92,136 @@ class ImportJobViewSet(viewsets.ReadOnlyModelViewSet):
         if not file_path:
             return Response({'detail': 'file_path es requerido'}, status=status.HTTP_400_BAD_REQUEST)
 
-        sheets = request.data.get('sheets')
-        if isinstance(sheets, str):
-            sheets = [s.strip() for s in sheets.split(',') if s.strip()]
-
-        dry_run = bool(request.data.get('dry_run', False))
-        importer = ExcelMasterImporter(file_path=file_path, dry_run=dry_run, initiated_by=request.user, sheets=sheets)
+        sheets = _parse_sheets(request.data.get('sheets'))
+        dry_run = _parse_bool(request.data.get('dry_run', False), default=False)
+        try:
+            column_mapping = _parse_column_mapping(request.data.get('column_mapping'))
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        importer = ExcelMasterImporter(
+            file_path=file_path,
+            dry_run=dry_run,
+            initiated_by=request.user,
+            sheets=sheets,
+            column_mapping=column_mapping,
+        )
         job = importer.run()
         return Response(ImportJobSerializer(job).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['post'], url_path='preview-upload')
+    def preview_upload(self, request):
+        upload = request.FILES.get('file')
+        if not upload:
+            return Response({'detail': 'Debes adjuntar un archivo Excel en el campo "file".'}, status=status.HTTP_400_BAD_REQUEST)
+        if not upload.name.lower().endswith(('.xlsx', '.xlsm', '.xltx', '.xltm')):
+            return Response({'detail': 'Formato no soportado. Usa un archivo .xlsx/.xlsm.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        sheets = _parse_sheets(request.data.get('sheets'))
+        try:
+            column_mapping = _parse_column_mapping(request.data.get('column_mapping'))
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        source_hash = _file_sha256(upload)
+
+        session = ImportUploadSession.objects.create(
+            original_filename=upload.name,
+            uploaded_by=request.user,
+            source_hash=source_hash,
+            selected_sheets=sheets or [],
+            column_mapping=column_mapping,
+            status=ImportUploadStatus.UPLOADED,
+        )
+        session.stored_file.save(f'{uuid.uuid4()}_{upload.name}', upload, save=True)
+
+        importer = ExcelMasterImporter(
+            file_path=session.stored_file.path,
+            dry_run=True,
+            initiated_by=request.user,
+            sheets=sheets,
+            column_mapping=column_mapping,
+        )
+        structure = importer.inspect_structure()
+        preview_job = importer.run()
+
+        session.preview_job = preview_job
+        session.status = ImportUploadStatus.PREVIEWED
+        session.save(update_fields=['preview_job', 'status', 'last_used_at'])
+
+        preview_issues = preview_job.issues.order_by('-severity', 'sheet_name', 'row_number', '-created_at')[:400]
+        return Response(
+            {
+                'upload_session': ImportUploadSessionSerializer(session).data,
+                'structure': structure,
+                'preview_job': ImportJobSerializer(preview_job).data,
+                'preview_issues': ImportIssueSerializer(preview_issues, many=True).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=False, methods=['post'], url_path='run-upload')
+    def run_upload(self, request):
+        upload_session_id = request.data.get('upload_session_id')
+        if not upload_session_id:
+            return Response({'detail': 'upload_session_id es requerido.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        session = ImportUploadSession.objects.filter(id=upload_session_id).first()
+        if not session:
+            return Response({'detail': 'Sesión de carga no encontrada.'}, status=status.HTTP_404_NOT_FOUND)
+        if not session.stored_file:
+            return Response({'detail': 'La sesión no tiene archivo asociado.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        sheets = _parse_sheets(request.data.get('sheets')) or session.selected_sheets or None
+        try:
+            request_mapping = _parse_column_mapping(request.data.get('column_mapping'))
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        column_mapping = request_mapping or session.column_mapping or {}
+
+        importer = ExcelMasterImporter(
+            file_path=session.stored_file.path,
+            dry_run=False,
+            initiated_by=request.user,
+            sheets=sheets,
+            column_mapping=column_mapping,
+        )
+        job = importer.run()
+
+        session.executed_job = job
+        session.status = ImportUploadStatus.EXECUTED
+        session.selected_sheets = sheets or []
+        session.column_mapping = column_mapping
+        session.save(update_fields=['executed_job', 'status', 'selected_sheets', 'column_mapping', 'last_used_at'])
+
+        return Response(
+            {
+                'upload_session': ImportUploadSessionSerializer(session).data,
+                'job': ImportJobSerializer(job).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=['get'], url_path='issues-report')
+    def issues_report(self, request, pk=None):
+        job = self.get_object()
+        issues = job.issues.order_by('sheet_name', 'row_number', 'created_at')
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = f'attachment; filename="import_issues_{job.id}.csv"'
+        writer = csv.writer(response)
+        writer.writerow(['severity', 'sheet_name', 'row_number', 'column_name', 'error_code', 'message', 'raw_value', 'created_at'])
+        for issue in issues:
+            writer.writerow(
+                [
+                    issue.severity,
+                    issue.sheet_name,
+                    issue.row_number or '',
+                    issue.column_name or '',
+                    issue.error_code or '',
+                    issue.message or '',
+                    issue.raw_value or '',
+                    timezone.localtime(issue.created_at).isoformat(),
+                ]
+            )
+        return response
 
 
 class ImportIssueViewSet(viewsets.ReadOnlyModelViewSet):
@@ -46,7 +232,6 @@ class ImportIssueViewSet(viewsets.ReadOnlyModelViewSet):
     ordering_fields = ['created_at', 'row_number']
 
     required_roles_per_action = {
-        'list': UserRole.ADMINISTRADOR,
-        'retrieve': UserRole.ADMINISTRADOR,
+        'list': UserRole.OPERADOR,
+        'retrieve': UserRole.OPERADOR,
     }
-

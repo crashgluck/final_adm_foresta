@@ -6,7 +6,15 @@ from apps.acquisitions.views import RFIDCardViewSet, RemoteControlViewSet, Vehic
 from apps.api.views import DashboardSummaryView
 from apps.audits.views import AuditEventLogViewSet, UserSessionLogViewSet
 from apps.data_imports.views import ImportIssueViewSet, ImportJobViewSet
-from apps.finance.views import CommonExpenseDebtViewSet, FinancialMovementViewSet, PaymentAgreementViewSet, ServiceDebtViewSet, UnpaidFineViewSet
+from apps.finance.views import (
+    CommonExpenseDebtViewSet,
+    FinanceConsolidatedView,
+    FinanceSummaryView,
+    FinancialMovementViewSet,
+    PaymentAgreementViewSet,
+    ServiceDebtViewSet,
+    UnpaidFineViewSet,
+)
 from apps.maps_app.views import ObjectiveViewSet, OwnersMapView, ParcelOptionsView, ParcelVisitSummaryView, VisitViewSet
 from apps.missions.views import DroneFlightViewSet, MissionReportViewSet, MissionViewSet
 from apps.notes.views import AdministrativeNoteViewSet
@@ -53,6 +61,8 @@ router.register('audits/sessions', UserSessionLogViewSet, basename='audit-sessio
 urlpatterns = [
     path('', include(router.urls)),
     path('dashboard/resumen/', DashboardSummaryView.as_view(), name='dashboard-resumen'),
+    path('finance/summary/', FinanceSummaryView.as_view(), name='finance-summary'),
+    path('finance/consolidated/', FinanceConsolidatedView.as_view(), name='finance-consolidated'),
     path('maps/owners-map/', OwnersMapView.as_view(), name='owners-map'),
     path('maps/visit-summary/', ParcelVisitSummaryView.as_view(), name='parcel-visit-summary'),
     path('maps/parcel-options/', ParcelOptionsView.as_view(), name='parcel-options'),
