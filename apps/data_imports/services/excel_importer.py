@@ -29,6 +29,10 @@ from apps.works.models import ParcelWorkStatus
 logger = logging.getLogger(__name__)
 
 
+class ImportCancelledError(Exception):
+    pass
+
+
 @dataclass
 class Counter:
     rows_read: int = 0
@@ -68,6 +72,8 @@ class ExcelMasterImporter:
         self.initiated_by = initiated_by
         self.sheets_filter = {s.strip() for s in sheets} if sheets else None
         self.column_mapping = self._normalize_column_mapping(column_mapping or {})
+        self._cancel_check_every = 25
+        self._operations_since_cancel_check = 0
 
     def _parser_map(self):
         return {
@@ -149,9 +155,13 @@ class ExcelMasterImporter:
         parser_map = self._parser_map()
 
         workbook = load_workbook(self.file_path, data_only=True)
+        cancelled = False
         for sheet_name, parser in parser_map.items():
             if self.sheets_filter and sheet_name not in self.sheets_filter:
                 continue
+            if self._is_cancel_requested(job):
+                cancelled = True
+                break
             if sheet_name not in workbook.sheetnames:
                 self._issue(job, None, IssueSeverity.WARNING, sheet_name, None, None, 'sheet_missing', 'Hoja no encontrada')
                 continue
@@ -163,6 +173,19 @@ class ExcelMasterImporter:
             try:
                 parser(ws, job, sheet_result, counter)
                 sheet_result.status = ImportStatus.PARTIAL if counter.errors else ImportStatus.SUCCESS
+            except ImportCancelledError:
+                cancelled = True
+                sheet_result.status = ImportStatus.CANCELLED
+                self._issue(
+                    job,
+                    sheet_result,
+                    IssueSeverity.WARNING,
+                    sheet_name,
+                    None,
+                    None,
+                    'job_cancelled',
+                    'Importación detenida por solicitud de cancelación.',
+                )
             except Exception as exc:  # pragma: no cover
                 logger.exception('Error importando hoja %s', sheet_name)
                 counter.errors += 1
@@ -189,8 +212,10 @@ class ExcelMasterImporter:
                 f'skipped={counter.skipped}, errors={counter.errors}, warnings={counter.warnings}'
             )
             sheet_result.save()
+            if cancelled:
+                break
 
-        self._finalize_job(job)
+        self._finalize_job(job, cancelled=cancelled)
         return job
 
     def _normalize_column_mapping(self, value):
@@ -214,7 +239,7 @@ class ExcelMasterImporter:
                         normalized[sheet_key][source_key] = [mapped_key]
         return normalized
 
-    def _finalize_job(self, job: ImportJob):
+    def _finalize_job(self, job: ImportJob, cancelled: bool = False):
         aggregates = job.sheet_results.aggregate(
             inserted=Sum('inserted'),
             updated=Sum('updated'),
@@ -228,8 +253,15 @@ class ExcelMasterImporter:
         job.total_errors = aggregates['errors'] or 0
         job.total_warnings = aggregates['warnings'] or 0
         job.finished_at = timezone.now()
+        cancelled = cancelled or self._is_cancel_requested(job)
 
-        if job.total_errors == 0:
+        if cancelled:
+            job.status = ImportStatus.CANCELLED
+            details = dict(job.details or {})
+            details['cancel_requested'] = True
+            details.setdefault('cancelled_at', timezone.now().isoformat())
+            job.details = details
+        elif job.total_errors == 0:
             job.status = ImportStatus.SUCCESS
         elif job.total_inserted > 0 or job.total_updated > 0:
             job.status = ImportStatus.PARTIAL
@@ -245,8 +277,22 @@ class ExcelMasterImporter:
                 'total_warnings',
                 'finished_at',
                 'status',
+                'details',
             ]
         )
+
+    def _is_cancel_requested(self, job: ImportJob) -> bool:
+        job.refresh_from_db(fields=['status', 'details'])
+        details = job.details or {}
+        return job.status == ImportStatus.CANCELLED or bool(details.get('cancel_requested'))
+
+    def _raise_if_cancel_requested(self, job: ImportJob, force: bool = False):
+        self._operations_since_cancel_check += 1
+        if not force and self._operations_since_cancel_check < self._cancel_check_every:
+            return
+        self._operations_since_cancel_check = 0
+        if self._is_cancel_requested(job):
+            raise ImportCancelledError()
 
     def _hash_file(self, path: Path) -> str:
         digest = hashlib.sha256()
@@ -351,6 +397,7 @@ class ExcelMasterImporter:
         return None
 
     def _upsert_parcel(self, raw_code: str, counter: Counter, job: ImportJob, sheet_result: ImportSheetResult, row_number: int):
+        self._raise_if_cancel_requested(job)
         code = normalize_parcel_code(raw_code)
         if not code:
             counter.warnings += 1

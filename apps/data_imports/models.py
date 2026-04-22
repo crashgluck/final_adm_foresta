@@ -7,6 +7,7 @@ from django.db import models
 class ImportStatus(models.TextChoices):
     PENDING = 'PENDING', 'Pending'
     RUNNING = 'RUNNING', 'Running'
+    CANCELLED = 'CANCELLED', 'Cancelled'
     SUCCESS = 'SUCCESS', 'Success'
     PARTIAL = 'PARTIAL', 'Partial'
     FAILED = 'FAILED', 'Failed'

@@ -12,7 +12,7 @@ from rest_framework.response import Response
 
 from apps.accounts.models import UserRole
 from apps.core.permissions import RoleBasedActionPermission
-from apps.data_imports.models import ImportIssue, ImportJob, ImportUploadSession, ImportUploadStatus
+from apps.data_imports.models import ImportIssue, ImportJob, ImportStatus, ImportUploadSession, ImportUploadStatus
 from apps.data_imports.serializers import ImportIssueSerializer, ImportJobSerializer, ImportUploadSessionSerializer
 from apps.data_imports.services.excel_importer import ExcelMasterImporter
 
@@ -84,6 +84,10 @@ class ImportJobViewSet(viewsets.ReadOnlyModelViewSet):
         'preview_upload': UserRole.OPERADOR,
         'run_upload': UserRole.OPERADOR,
         'issues_report': UserRole.OPERADOR,
+        'cancel': UserRole.OPERADOR,
+        'stop': UserRole.OPERADOR,
+        'terminate': UserRole.OPERADOR,
+        'cancel_requested': UserRole.OPERADOR,
     }
 
     @action(detail=False, methods=['post'])
@@ -222,6 +226,64 @@ class ImportJobViewSet(viewsets.ReadOnlyModelViewSet):
                 ]
             )
         return response
+
+    def _request_cancel(self, request, job: ImportJob, source: str):
+        terminal_statuses = {
+            ImportStatus.SUCCESS,
+            ImportStatus.PARTIAL,
+            ImportStatus.FAILED,
+            ImportStatus.CANCELLED,
+        }
+        if job.status in terminal_statuses:
+            return Response(
+                {
+                    'detail': f'El job ya está finalizado con estado {job.status}.',
+                    'status': job.status,
+                    'id': str(job.id),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        details = dict(job.details or {})
+        details['cancel_requested'] = True
+        details['cancel_requested_at'] = timezone.now().isoformat()
+        details['cancel_requested_by'] = str(getattr(request.user, 'id', ''))
+        details['cancel_request_source'] = source
+
+        job.status = ImportStatus.CANCELLED
+        job.finished_at = timezone.now()
+        job.details = details
+        job.save(update_fields=['status', 'finished_at', 'details'])
+
+        return Response(
+            {
+                'detail': 'Solicitud de cancelación registrada.',
+                'status': job.status,
+                'id': str(job.id),
+                'cancel_requested': True,
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        job = self.get_object()
+        return self._request_cancel(request, job, source='cancel')
+
+    @action(detail=True, methods=['post'])
+    def stop(self, request, pk=None):
+        job = self.get_object()
+        return self._request_cancel(request, job, source='stop')
+
+    @action(detail=True, methods=['post'])
+    def terminate(self, request, pk=None):
+        job = self.get_object()
+        return self._request_cancel(request, job, source='terminate')
+
+    @action(detail=True, methods=['post'], url_path='cancel_requested')
+    def cancel_requested(self, request, pk=None):
+        job = self.get_object()
+        return self._request_cancel(request, job, source='cancel_requested')
 
 
 class ImportIssueViewSet(viewsets.ReadOnlyModelViewSet):
