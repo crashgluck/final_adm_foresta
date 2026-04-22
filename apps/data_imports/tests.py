@@ -146,3 +146,17 @@ class ImportApiFlowTests(APITestCase):
 
         response = self.client.post(f'/api/v1/imports/jobs/{job.id}/cancel/', data={}, format='json')
         self.assertEqual(response.status_code, 409)
+
+    def test_post_detail_endpoint_is_backward_compatible(self):
+        job = ImportJob.objects.create(
+            source_file='legacy.xlsx',
+            source_hash='hash',
+            source_path='/tmp/legacy.xlsx',
+            dry_run=True,
+            status=ImportStatus.RUNNING,
+            initiated_by=self.user,
+        )
+
+        response = self.client.post(f'/api/v1/imports/jobs/{job.id}/', data={}, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(str(response.data['id']), str(job.id))

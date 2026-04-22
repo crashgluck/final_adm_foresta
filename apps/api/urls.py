@@ -1,4 +1,4 @@
-from django.urls import include, path
+from django.urls import include, path, re_path
 from rest_framework.routers import DefaultRouter
 
 from apps.access_control.views import AccessRecordViewSet, BlacklistEntryViewSet
@@ -59,6 +59,14 @@ router.register('audits/events', AuditEventLogViewSet, basename='audit-events')
 router.register('audits/sessions', UserSessionLogViewSet, basename='audit-sessions')
 
 urlpatterns = [
+    # Backward compatibility:
+    # some legacy clients hit POST /imports/jobs/{id}/ expecting detail polling.
+    # Accept POST as retrieve to avoid 405 during long-running import monitoring.
+    re_path(
+        r'^imports/jobs/(?P<pk>[0-9a-fA-F-]{36})/$',
+        ImportJobViewSet.as_view({'get': 'retrieve', 'post': 'retrieve'}),
+        name='import-jobs-detail-legacy-post',
+    ),
     path('', include(router.urls)),
     path('dashboard/resumen/', DashboardSummaryView.as_view(), name='dashboard-resumen'),
     path('finance/summary/', FinanceSummaryView.as_view(), name='finance-summary'),
