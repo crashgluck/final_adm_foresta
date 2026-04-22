@@ -1,5 +1,3 @@
-﻿import hashlib
-import logging
 import os
 from pathlib import Path
 from datetime import timedelta
@@ -7,7 +5,6 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(BASE_DIR / '.env')
-logger = logging.getLogger(__name__)
 
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'dev-only-change-this-key-to-a-secure-value-1234567890')
 DEBUG = os.getenv('DJANGO_DEBUG', 'false').lower() == 'true'
@@ -79,24 +76,32 @@ WSGI_APPLICATION = 'config.wsgi.application'
 ASGI_APPLICATION = 'config.asgi.application'
 
 DB_ENGINE = os.getenv('DB_ENGINE', 'sqlite').lower()
-if DB_ENGINE == 'postgres':
+
+if DB_ENGINE == 'mysql':
     DATABASES = {
         'default': {
-            'ENGINE': 'django.db.backends.postgresql',
-            'NAME': os.getenv('DB_NAME', 'parcelas'),
-            'USER': os.getenv('DB_USER', 'postgres'),
+            'ENGINE': 'django.db.backends.mysql',
+            'NAME': os.getenv('DB_NAME', ''),
+            'USER': os.getenv('DB_USER', ''),
             'PASSWORD': os.getenv('DB_PASSWORD', ''),
             'HOST': os.getenv('DB_HOST', 'localhost'),
-            'PORT': os.getenv('DB_PORT', '5432'),
+            'PORT': os.getenv('DB_PORT', '3306'),
+            'CONN_MAX_AGE': int(os.getenv('DB_CONN_MAX_AGE', '60')),
+            'OPTIONS': {
+                'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+                'charset': 'utf8mb4',
+            },
         }
     }
-else:
+elif DB_ENGINE == 'sqlite':
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
             'NAME': BASE_DIR / 'db.sqlite3',
         }
     }
+else:
+    raise ValueError(f"DB_ENGINE no soportado: {DB_ENGINE}")
 
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
@@ -141,15 +146,6 @@ REST_FRAMEWORK = {
     'EXCEPTION_HANDLER': 'apps.core.exceptions.custom_exception_handler',
 }
 
-raw_jwt_signing_key = os.getenv('JWT_SIGNING_KEY', SECRET_KEY)
-if len(raw_jwt_signing_key.encode('utf-8')) < 32:
-    logger.warning(
-        'JWT signing key shorter than 32 bytes. Deriving SHA-256 key. Set JWT_SIGNING_KEY>=32 bytes to remove this warning.'
-    )
-    JWT_SIGNING_KEY = hashlib.sha256(raw_jwt_signing_key.encode('utf-8')).hexdigest()
-else:
-    JWT_SIGNING_KEY = raw_jwt_signing_key
-
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=int(os.getenv('JWT_ACCESS_MINUTES', '15'))),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=int(os.getenv('JWT_REFRESH_DAYS', '7'))),
@@ -157,7 +153,6 @@ SIMPLE_JWT = {
     'BLACKLIST_AFTER_ROTATION': True,
     'UPDATE_LAST_LOGIN': True,
     'AUTH_HEADER_TYPES': ('Bearer',),
-    'SIGNING_KEY': JWT_SIGNING_KEY,
 }
 
 SPECTACULAR_SETTINGS = {
@@ -189,4 +184,3 @@ LOGGING = {
         'level': os.getenv('LOG_LEVEL', 'INFO'),
     },
 }
-
