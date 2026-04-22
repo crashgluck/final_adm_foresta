@@ -1,9 +1,11 @@
-﻿import os
+import os
 import tempfile
 
 from django.test import TestCase
 from openpyxl import Workbook
+from rest_framework.test import APITestCase
 
+from apps.accounts.models import User, UserRole
 from apps.core.normalizers import normalize_parcel_code
 from apps.data_imports.services.excel_importer import ExcelMasterImporter
 from apps.parcels.models import Parcel
@@ -19,8 +21,8 @@ class ImportAndNormalizerTests(TestCase):
         wb = Workbook()
         ws = wb.active
         ws.title = 'Datos_Propietarios'
-        ws.append(['PARCELA', 'NOMBRE COMPLETO', 'RUT', 'DV', 'TELÉFONO FIJO', 'TELEFONO MÓVIL', 'E-MAIL'])
-        ws.append(['B-01', 'JUAN PEREZ', '12345678', '5', '', '912345678', 'juan@example.com'])
+        ws.append(['PARCELA', 'NOMBRE COMPLETO', 'RUT', 'DV', 'TELEFONO', 'EMAIL'])
+        ws.append(['B-01', 'JUAN PEREZ', '12345678', '5', '912345678', 'juan@example.com'])
 
         fd, path = tempfile.mkstemp(suffix='.xlsx')
         os.close(fd)
@@ -35,3 +37,66 @@ class ImportAndNormalizerTests(TestCase):
         self.assertTrue(job.dry_run)
         self.assertGreaterEqual(job.total_inserted, 1)
         self.assertEqual(Parcel.objects.count(), 0)
+
+
+class ImportApiFlowTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email='operador@example.com',
+            password='test123456',
+            role=UserRole.OPERADOR,
+        )
+        self.client.force_authenticate(self.user)
+
+    def _build_workbook_file(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = 'Datos_Propietarios'
+        ws.append(['PARCELA', 'NOMBRE COMPLETO', 'RUT', 'DV', 'TELEFONO', 'EMAIL'])
+        ws.append(['B-01', 'JUAN PEREZ', '12345678', '5', '912345678', 'juan@example.com'])
+
+        fd, path = tempfile.mkstemp(suffix='.xlsx')
+        os.close(fd)
+        wb.save(path)
+        return path
+
+    def test_preview_then_run_upload_flow(self):
+        file_path = self._build_workbook_file()
+        try:
+            with open(file_path, 'rb') as fh:
+                preview_response = self.client.post(
+                    '/api/v1/imports/jobs/preview-upload/',
+                    data={'file': fh},
+                    format='multipart',
+                )
+
+            self.assertEqual(preview_response.status_code, 201)
+            upload_session_id = preview_response.data['upload_session']['id']
+            self.assertTrue(upload_session_id)
+            self.assertTrue(preview_response.data['preview_job']['dry_run'])
+
+            run_response = self.client.post(
+                '/api/v1/imports/jobs/run-upload/',
+                data={'upload_session_id': upload_session_id},
+                format='json',
+            )
+            self.assertEqual(run_response.status_code, 201)
+            self.assertFalse(run_response.data['job']['dry_run'])
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+    def test_preview_rejects_invalid_column_mapping_json(self):
+        file_path = self._build_workbook_file()
+        try:
+            with open(file_path, 'rb') as fh:
+                response = self.client.post(
+                    '/api/v1/imports/jobs/preview-upload/',
+                    data={'file': fh, 'column_mapping': '{invalid-json'},
+                    format='multipart',
+                )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn('column_mapping', response.data.get('detail', ''))
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)

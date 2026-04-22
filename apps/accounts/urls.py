@@ -3,6 +3,8 @@ from rest_framework.routers import DefaultRouter
 
 from apps.accounts.views import (
     ChangePasswordView,
+    PasswordResetConfirmView,
+    PasswordResetRequestView,
     CustomTokenObtainPairView,
     CustomTokenRefreshView,
     LogoutView,
@@ -23,6 +25,8 @@ urlpatterns = [
     path('auth/logout/', LogoutView.as_view(), name='logout'),
     path('auth/me/', MeView.as_view(), name='me'),
     path('auth/change-password/', ChangePasswordView.as_view(), name='change_password'),
+    path('auth/password-reset/request/', PasswordResetRequestView.as_view(), name='password-reset-request'),
+    path('auth/password-reset/confirm/', PasswordResetConfirmView.as_view(), name='password-reset-confirm'),
     path('roles/', RoleListView.as_view(), name='roles-list'),
     path('actor-types/', ActorTypeListView.as_view(), name='actor-types-list'),
     path('', include(router.urls)),
