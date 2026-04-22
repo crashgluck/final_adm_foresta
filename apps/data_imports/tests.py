@@ -7,6 +7,7 @@ from rest_framework.test import APITestCase
 
 from apps.accounts.models import User, UserRole
 from apps.core.normalizers import normalize_parcel_code
+from apps.data_imports.models import ImportJob, ImportStatus
 from apps.data_imports.services.excel_importer import ExcelMasterImporter
 from apps.parcels.models import Parcel
 
@@ -100,3 +101,48 @@ class ImportApiFlowTests(APITestCase):
         finally:
             if os.path.exists(file_path):
                 os.remove(file_path)
+
+    def test_cancel_running_job(self):
+        job = ImportJob.objects.create(
+            source_file='test.xlsx',
+            source_hash='hash',
+            source_path='/tmp/test.xlsx',
+            dry_run=False,
+            status=ImportStatus.RUNNING,
+            initiated_by=self.user,
+        )
+
+        response = self.client.post(f'/api/v1/imports/jobs/{job.id}/cancel/', data={}, format='json')
+        self.assertEqual(response.status_code, 202)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, ImportStatus.CANCELLED)
+        self.assertTrue((job.details or {}).get('cancel_requested'))
+
+    def test_stop_and_terminate_aliases(self):
+        for endpoint in ('stop', 'terminate', 'cancel_requested'):
+            job = ImportJob.objects.create(
+                source_file=f'{endpoint}.xlsx',
+                source_hash='hash',
+                source_path=f'/tmp/{endpoint}.xlsx',
+                dry_run=False,
+                status=ImportStatus.PENDING,
+                initiated_by=self.user,
+            )
+            response = self.client.post(f'/api/v1/imports/jobs/{job.id}/{endpoint}/', data={}, format='json')
+            self.assertEqual(response.status_code, 202)
+            job.refresh_from_db()
+            self.assertEqual(job.status, ImportStatus.CANCELLED)
+
+    def test_cancel_terminal_job_returns_conflict(self):
+        job = ImportJob.objects.create(
+            source_file='done.xlsx',
+            source_hash='hash',
+            source_path='/tmp/done.xlsx',
+            dry_run=False,
+            status=ImportStatus.SUCCESS,
+            initiated_by=self.user,
+        )
+
+        response = self.client.post(f'/api/v1/imports/jobs/{job.id}/cancel/', data={}, format='json')
+        self.assertEqual(response.status_code, 409)
